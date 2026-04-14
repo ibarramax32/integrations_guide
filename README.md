@@ -11,7 +11,7 @@
 - [3. Deduplication: How to Avoid Sending Duplicate Data](#3-deduplication-how-to-avoid-sending-duplicate-data)
 - [4. Wazuh Python Framework](#4-wazuh-python-framework)
 - [5. Practical Use Cases](#5-practical-use-cases)
-  - [Case 1: Wodle aws-s3 — AWS CloudTrail (Production Reference)](#case-1-wodle-aws-s3--aws-cloudtrail-production-reference)
+  - [Case 1: AWS CloudTrail via Wodle aws-s3](#case-1-aws-cloudtrail-via-wodle-aws-s3)
   - [Case 2: Log Data Collection via Logcollector](#case-2-log-data-collection-via-logcollector)
   - [Case 3: Reactive Integration via Integratord](#case-3-reactive-integration-via-integratord)
     - [3A: VirusTotal (Enrich + Re-inject via UNIX Socket)](#3a-virustotal-enrich--re-inject-via-unix-socket)
@@ -29,7 +29,7 @@
 Wazuh processes data through its **analysis engine (analysisd)**. There are several paths for injecting custom data:
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌──────────────────────────┐
+┌─────────────────┐     ┌─────────────────���┐     ┌──────────────────────────┐
 │ External Source  │────▶│  Custom Script    │────▶│  Wazuh Input             │
 │ (API, DB, file)  │     │  (Python/Bash)    │     │                          │
 └─────────────────┘     └──────────────────┘     │  Option A: Wodle          │
@@ -59,7 +59,7 @@ Wazuh processes data through its **analysis engine (analysisd)**. There are seve
 
 | Method | Mechanism | Best For |
 |---|---|---|
-| **Wodle Command / aws-s3** | `ossec.conf` runs your script on a schedule; output via stdout or UNIX socket | Polling APIs, cloud services, DB queries |
+| **Wodle (aws-s3 / command)** | `ossec.conf` runs a module or script on a schedule | Cloud services, polling APIs, DB queries |
 | **Logcollector** | Wazuh reads a log file your script or application writes to | Monitoring application logs, third-party tool output |
 | **Integratord** | Wazuh's native integration framework triggered by alerts | Reactive enrichment, notifications |
 | **Syslog Output** | Script sends syslog to the agent/manager | Legacy systems |
@@ -97,7 +97,7 @@ Wazuh expects **one line of text = one event**. The most effective format is **s
 
 | # | Rule | Why |
 |---|---|---|
-| 1 | **One line per event** — no newlines inside JSON | Wazuh treats each line as a separate event. Multi-line JSON will be parsed as multiple broken events. |
+| 1 | **One line per event** — no newlines inside JSON | Wazuh treats each line as a separate event. Multi-line JSON = multiple broken events. |
 | 2 | **Always include `timestamp`** — ISO 8601 format | Ensures accurate event chronology in the indexer. |
 | 3 | **Include a unique identifier field** | Required for effective deduplication (see Section 3). |
 | 4 | **Include an `integration` field** | Allows filtering in rules with `<field name="integration">`. |
@@ -119,7 +119,7 @@ def send_event_stdout(event: dict):
 
 #### Method 2: UNIX Socket (Production — Direct to analysisd)
 
-This is how Wazuh's own AWS integration sends events. It writes directly to the `analysisd` UNIX socket, bypassing stdout. Faster, more reliable.
+This is how Wazuh's own integrations send events. It writes directly to the `analysisd` UNIX socket, bypassing stdout. Faster, more reliable for high-volume use cases.
 
 From [`wodles/aws/wazuh_integration.py`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/wazuh_integration.py#L293-L324):
 
@@ -162,6 +162,8 @@ This is the **most critical** and most frequently misimplemented aspect.
 
 ### Strategy A: State File with Last Timestamp/ID
 
+Persist the last processed timestamp or event ID between runs. On next execution, only process events newer than the saved marker.
+
 ```python
 import json, os
 
@@ -178,9 +180,17 @@ def save_state(state: dict):
     with open(tmp_file, 'w') as f:
         json.dump(state, f)
     os.replace(tmp_file, STATE_FILE)  # Atomic on POSIX
+
+def get_new_events(all_events: list, state: dict) -> list:
+    last_ts = state.get("last_timestamp")
+    if last_ts is None:
+        return all_events
+    return [e for e in all_events if e["timestamp"] > last_ts]
 ```
 
 ### Strategy B: Hash Set for Exact Duplicate Detection
+
+Compute a hash of identifying fields. Maintain a set of seen hashes and skip any event whose hash exists.
 
 ```python
 import hashlib, json, os
@@ -207,6 +217,8 @@ def is_duplicate(event: dict, seen: set) -> bool:
 
 ### Strategy C: API Cursor with Pagination
 
+Many modern APIs support cursors or temporal pagination. Most reliable when the source API supports it.
+
 ```python
 import requests
 
@@ -223,61 +235,6 @@ def fetch_with_cursor(api_url: str, headers: dict, state: dict) -> tuple:
     return data.get("results", []), data.get("next_cursor")
 ```
 
-### Strategy D: SQLite Database (Production-Grade)
-
-This is **how Wazuh itself solves deduplication**. The `WazuhAWSDatabase` class in [`wodles/aws/wazuh_integration.py`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/wazuh_integration.py#L394-L542) uses SQLite to track processed log files. The `AWSBucket` class in [`wodles/aws/buckets_s3/aws_bucket.py`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/buckets_s3/aws_bucket.py) queries the DB before processing each file:
-
-```python
-# Simplified from aws_bucket.py — the actual dedup query:
-sql_already_processed = """
-    SELECT count(*) FROM {table_name}
-    WHERE bucket_path=:bucket_path
-      AND aws_account_id=:aws_account_id
-      AND aws_region=:aws_region
-      AND log_key=:log_name;
-"""
-# If count > 0, skip the file. Otherwise, process and INSERT.
-```
-
-Reusable pattern for your own integrations:
-
-```python
-import sqlite3, os
-from datetime import datetime, timezone, timedelta
-
-class IntegrationDatabase:
-    def __init__(self, db_path: str):
-        self.conn = sqlite3.connect(db_path)
-        self.cursor = self.conn.cursor()
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS processed_events (
-                event_id TEXT PRIMARY KEY,
-                processed_at TEXT NOT NULL
-            );""")
-        self.conn.commit()
-
-    def is_duplicate(self, event_id: str) -> bool:
-        result = self.cursor.execute(
-            "SELECT 1 FROM processed_events WHERE event_id = ?", (event_id,)
-        ).fetchone()
-        return result is not None
-
-    def mark_processed(self, event_id: str):
-        self.cursor.execute(
-            "INSERT OR IGNORE INTO processed_events (event_id, processed_at) VALUES (?, ?)",
-            (event_id, datetime.now(timezone.utc).isoformat())
-        )
-
-    def cleanup(self, days: int = 90):
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        self.cursor.execute("DELETE FROM processed_events WHERE processed_at < ?", (cutoff,))
-
-    def close(self):
-        self.conn.commit()
-        self.cursor.execute("PRAGMA optimize;")
-        self.conn.close()
-```
-
 ### Strategy Comparison
 
 | Strategy | Pros | Cons | Use When |
@@ -285,7 +242,6 @@ class IntegrationDatabase:
 | **State file (timestamp/ID)** | Simple, low disk usage | May miss out-of-order events | API guarantees chronological order |
 | **Hash set (JSON file)** | Detects exact duplicates | Doesn't scale past ~50K | Small-scale sources |
 | **API cursor** | Most reliable, API-native | Depends on API support | Well-designed APIs |
-| **SQLite database** | Scales to millions, ACID, queryable | Slightly more complex | Production integrations (how Wazuh does it) |
 
 ---
 
@@ -330,43 +286,39 @@ result = rule.get_rules(search={"value": "sshd", "negation": False})
 
 ---
 
-### Case 1: Wodle aws-s3 — AWS CloudTrail (Production Reference)
+### Case 1: AWS CloudTrail via Wodle aws-s3
 
-**Scenario:** Ingest AWS CloudTrail logs from an S3 bucket — the most common cloud integration.
+**Scenario:** Ingest AWS CloudTrail logs from an S3 bucket — the most common cloud integration and the best example of a production Wazuh ingestion wodle.
 
-**Method:** Wazuh's built-in `wodle name="aws-s3"` — a production-grade integration that demonstrates how Wazuh itself solves data ingestion at scale.
+**Method:** Wazuh's built-in `wodle name="aws-s3"`
 
-#### Why Study This Integration
+#### Prerequisites
 
-Before building your own custom integration, it's worth understanding how Wazuh's AWS wodle works. It's the gold standard for how Wazuh ingests external data, and every pattern you need is here:
+1. **AWS CloudTrail** must be configured to deliver logs to an S3 bucket
+2. **IAM credentials** with read access to the bucket (profile, IAM role, or access keys)
+3. The **Wazuh manager** must have `boto3` and its dependencies installed (included by default in Wazuh packages)
 
-| Pattern | How Wazuh AWS Does It | Source File |
-|---|---|---|
-| **Event delivery** | UNIX socket direct to `analysisd` queue | [`wazuh_integration.py` → `send_msg()`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/wazuh_integration.py#L293-L324) |
-| **Deduplication** | SQLite DB — checks `already_processed()` before ingesting each log file | [`aws_bucket.py` → `already_processed()`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/buckets_s3/aws_bucket.py#L233-L239) |
-| **State persistence** | SQLite `mark_complete()` with `DATETIME('now')` timestamps | [`aws_bucket.py` → `mark_complete()`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/buckets_s3/aws_bucket.py#L244-L254) |
-| **DB maintenance** | Retains only last 500 records per region, deletes older entries | [`aws_bucket.py` → `db_maintenance()`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/buckets_s3/aws_bucket.py#L271-L281) |
-| **Modular architecture** | Base class `WazuhIntegration` → `WazuhAWSDatabase` → per-service subclasses | [`wazuh_integration.py`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/wazuh_integration.py) |
-| **Oversized events** | Logs warning if event exceeds `MAX_EVENT_SIZE` (65,535 bytes) | [`utils.py` line 142](https://github.com/wazuh/wazuh/blob/master/wodles/utils.py#L142) |
+#### IAM Policy (Minimum Permissions)
 
-#### Architecture
-
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "WazuhCloudTrailReadOnly",
+    "Effect": "Allow",
+    "Action": [
+      "s3:GetObject",
+      "s3:ListBucket"
+    ],
+    "Resource": [
+      "arn:aws:s3:::my-cloudtrail-bucket",
+      "arn:aws:s3:::my-cloudtrail-bucket/*"
+    ]
+  }]
+}
 ```
-wodles/aws/
-├── wazuh_integration.py      # Base: UNIX socket + SQLite
-│   ├── WazuhIntegration      #   send_msg() → socket AF_UNIX
-│   └── WazuhAWSDatabase      #   SQLite init/close/metadata
-├── buckets_s3/
-│   ├── aws_bucket.py          # AWSBucket: iter_files → dedup → send
-│   ├── cloudtrail.py          # AWSCloudTrailBucket
-│   ├── guardduty.py           # AWSGuardDutyBucket
-│   ├── vpcflow.py             # AWSVPCFlowBucket
-│   └── ...
-├── services/
-│   ├── inspector.py
-│   └── cloudwatchlogs.py
-└── aws_s3.py                  # Entry point (arg parsing + dispatch)
-```
+
+> Add `"s3:DeleteObject"` if you want Wazuh to remove processed log files from the bucket.
 
 #### Configuration (ossec.conf)
 
@@ -376,49 +328,92 @@ wodles/aws/
   <interval>30m</interval>
   <run_on_start>yes</run_on_start>
   <skip_on_error>no</skip_on_error>
+
   <bucket type="cloudtrail">
     <name>my-cloudtrail-bucket</name>
     <aws_profile>default</aws_profile>
-    <!-- Optional filters -->
+    <!-- Optional: filter by region -->
     <!-- <regions>us-east-1,eu-west-1</regions> -->
+    <!-- Optional: only process logs after a specific date -->
     <!-- <only_logs_after>2026-JAN-01</only_logs_after> -->
+    <!-- Optional: filter by account -->
     <!-- <aws_account_id>123456789012</aws_account_id> -->
+    <!-- Optional: path prefix within the bucket -->
+    <!-- <path>AWSLogs/</path> -->
   </bucket>
 </wodle>
 ```
 
-Other supported bucket types: `guardduty`, `vpcflow`, `config`, `waf`, `alb`, `clb`, `nlb`, `server_access`, `cisco_umbrella`, `custom`.
+#### Configuration Options
 
-#### Event Flow (What Happens Internally)
+| Option | Description |
+|---|---|
+| `<name>` | S3 bucket name (required) |
+| `<aws_profile>` | AWS credentials profile from `~/.aws/credentials` |
+| `<iam_role_arn>` | IAM Role ARN for cross-account access |
+| `<regions>` | Comma-separated AWS regions to filter |
+| `<only_logs_after>` | Only process logs after this date (`YYYY-MMM-DD`) |
+| `<aws_account_id>` | Filter by specific AWS account ID |
+| `<path>` | S3 path prefix to limit scanning |
+| `<aws_organization_id>` | For AWS Organizations multi-account setups |
+| `<discard_field>` + `<discard_regex>` | Skip events matching a regex on a specific field |
 
+#### Other Supported Bucket Types
+
+The same `<wodle name="aws-s3">` supports many AWS services:
+
+```xml
+<wodle name="aws-s3">
+  <disabled>no</disabled>
+  <interval>30m</interval>
+  <run_on_start>yes</run_on_start>
+
+  <!-- CloudTrail -->
+  <bucket type="cloudtrail">
+    <name>my-cloudtrail-bucket</name>
+    <aws_profile>default</aws_profile>
+  </bucket>
+
+  <!-- GuardDuty -->
+  <bucket type="guardduty">
+    <name>my-guardduty-bucket</name>
+    <aws_profile>default</aws_profile>
+  </bucket>
+
+  <!-- VPC Flow Logs -->
+  <bucket type="vpcflow">
+    <name>my-vpcflow-bucket</name>
+    <aws_profile>default</aws_profile>
+  </bucket>
+
+  <!-- AWS Config -->
+  <bucket type="config">
+    <name>my-config-bucket</name>
+    <aws_profile>default</aws_profile>
+  </bucket>
+</wodle>
 ```
-1. aws_s3.py parses args, selects AWSCloudTrailBucket class
-2. iter_bucket() → init_db() creates SQLite table if not exists
-3. iter_files_in_bucket() → list_objects_v2() on S3
-4. For each log file:
-   a. already_processed()? → SELECT count(*) FROM table WHERE log_key=:name
-      - If yes → skip
-   b. get_log_file() → download + decompress (gzip/zip)
-   c. iter_events() → for each JSON event in "Records":
-      - event_should_be_skipped()? → apply discard_regex
-      - get_alert_msg() → wrap in {"integration":"aws", "aws":{...}}
-      - send_msg() → UNIX socket to /var/ossec/queue/sockets/queue
-   d. mark_complete() → INSERT INTO table (log_key, processed_date, ...)
-5. db_maintenance() → DELETE old records beyond retention limit (500)
-6. close_db() → COMMIT + PRAGMA optimize
+
+Full list of supported types: `cloudtrail`, `guardduty`, `vpcflow`, `config`, `waf`, `alb`, `clb`, `nlb`, `server_access`, `cisco_umbrella`, `custom`.
+
+#### Restart and Validate
+
+```bash
+# Restart the Wazuh manager to apply changes
+sudo systemctl restart wazuh-manager
+
+# Check logs for successful ingestion
+tail -f /var/ossec/logs/ossec.log | grep aws
 ```
 
-#### What a CloudTrail Event Looks Like in Wazuh
+#### What CloudTrail Events Look Like in Wazuh
+
+Once ingested, CloudTrail events appear in the Wazuh dashboard with the `aws` integration fields:
 
 ```json
 {
   "integration": "aws",
   "aws": {
-    "log_info": {
-      "aws_account_alias": "",
-      "log_file": "AWSLogs/123456789012/CloudTrail/us-east-1/2026/04/14/..._CloudTrail_us-east-1_20260414T0000Z_abc.json.gz",
-      "s3bucket": "my-cloudtrail-bucket"
-    },
     "eventVersion": "1.08",
     "eventSource": "iam.amazonaws.com",
     "eventName": "CreateUser",
@@ -426,23 +421,34 @@ Other supported bucket types: `guardduty`, `vpcflow`, `config`, `waf`, `alb`, `c
     "sourceIPAddress": "203.0.113.50",
     "userAgent": "console.amazonaws.com",
     "source": "cloudtrail",
-    "aws_account_id": "123456789012"
+    "aws_account_id": "123456789012",
+    "log_info": {
+      "s3bucket": "my-cloudtrail-bucket",
+      "log_file": "AWSLogs/.../CloudTrail/us-east-1/2026/04/14/..._CloudTrail_us-east-1_20260414T0000Z_abc.json.gz"
+    }
   }
 }
 ```
 
-#### Applying This to Your Own Custom Integrations
+You can then create rules matching these fields:
 
-If you're building a custom wodle that polls an external API, follow the same architecture:
+```xml
+<!-- Alert on IAM user creation -->
+<rule id="100200" level="8">
+  <if_sid>80200</if_sid>
+  <field name="aws.eventName">CreateUser</field>
+  <description>AWS IAM: New user created - $(aws.requestParameters.userName)</description>
+  <group>aws,iam,</group>
+</rule>
+```
 
-1. **Use UNIX socket** instead of stdout (set `<ignore_output>yes</ignore_output>` in your wodle config)
-2. **Use SQLite** for dedup state instead of JSON flat files (see Strategy D in Section 3)
-3. **Build a message header** matching the protocol: `"1:My-Integration:<json>"`
-4. **Implement DB maintenance** — don't let the state DB grow forever
+#### Why This Integration Matters as a Reference
 
-> **📖 Official Docs & Source Code:**
-> - [wodle `aws-s3` configuration reference](https://documentation.wazuh.com/current/user-manual/reference/ossec-conf/wodle-s3.html)
-> - [AWS CloudTrail integration guide](https://documentation.wazuh.com/current/cloud-security/amazon/services/supported-services/cloudtrail.html)
+The `wodle aws-s3` is the most mature production integration Wazuh ships. Its [source code](https://github.com/wazuh/wazuh/tree/master/wodles/aws) demonstrates all the patterns described in this guide — event delivery via UNIX socket, state tracking to avoid reprocessing, modular per-service architecture, and oversized event handling. If you're building a custom wodle, studying this source is the best starting point.
+
+> **📖 Official Docs:**
+> - [AWS CloudTrail integration](https://documentation.wazuh.com/current/cloud-security/amazon/services/supported-services/cloudtrail.html)
+> - [`wodle aws-s3` configuration reference](https://documentation.wazuh.com/current/user-manual/reference/ossec-conf/wodle-s3.html)
 > - [AWS module considerations](https://documentation.wazuh.com/current/cloud-security/amazon/services/prerequisites/considerations.html)
 > - **Source code:** [github.com/wazuh/wazuh/tree/master/wodles/aws](https://github.com/wazuh/wazuh/tree/master/wodles/aws)
 
@@ -612,7 +618,7 @@ When Wazuh detects a file integrity change, query VirusTotal to check if the fil
 1. `wazuh-integratord` detects an alert matching the `syscheck` group
 2. Writes the alert JSON to a temp file
 3. Calls: `virustotal.py <alert_file> <api_key> <hook_url> ...`
-4. The script reads the alert, extracts the `md5_after` hash
+4. The script reads the alert, extracts the `md5_after` hash from the `syscheck` block
 5. Queries the VirusTotal API (`/vtapi/v2/file/report`)
 6. Builds an enriched message:
 
@@ -640,7 +646,7 @@ alert_output = {
 7. **Sends it back to Wazuh via UNIX socket** (the key pattern):
 
 ```python
-# From virustotal.py lines 317-333 — actual Wazuh code:
+# From virustotal.py lines 317-333 — actual Wazuh production code:
 
 SOCKET_ADDR = f'{pwd}/queue/sockets/queue'
 
@@ -649,8 +655,8 @@ def send_msg(msg, agent=None):
     if not agent or agent['id'] == '000':
         string = '1:virustotal:{0}'.format(json.dumps(msg))
     else:
-        # Include agent info so the enriched alert is associated
-        # with the original agent
+        # Include agent info so the enriched alert is
+        # associated with the original agent
         location = '[{0}] ({1}) {2}'.format(
             agent['id'], agent['name'],
             agent['ip'] if 'ip' in agent else 'any'
@@ -722,7 +728,7 @@ payload = {'attachments': [msg]}
 4. **Sends it to Slack via HTTP POST** (simple and direct):
 
 ```python
-# From slack.py lines 195-207 — actual Wazuh code:
+# From slack.py lines 195-207 — actual Wazuh production code:
 
 def send_msg(msg, url):
     headers = {
@@ -770,6 +776,22 @@ chown root:wazuh /var/ossec/integrations/custom-myintegration
 **Scenario:** Query a PostgreSQL audit table every 10 minutes and inject change events.
 
 **Method:** Wodle Command
+
+#### ossec.conf Configuration
+
+```xml
+<wodle name="command">
+  <disabled>no</disabled>
+  <tag>db-audit</tag>
+  <command>/usr/bin/python3 /var/ossec/integrations/custom-db-audit.py</command>
+  <interval>10m</interval>
+  <ignore_output>no</ignore_output>
+  <run_on_start>yes</run_on_start>
+  <timeout>120</timeout>
+</wodle>
+```
+
+#### Full Script
 
 ```python
 #!/usr/bin/env python3
@@ -920,10 +942,9 @@ if __name__ == "__main__":
 ### Integration Checklist
 
 - [ ] **Format:** Single-line JSON per event
-- [ ] **`integration` field** for rule filtering
+- [ ] **`data.integration` field** for rule filtering
 - [ ] **ISO 8601 timestamp** in every event
-- [ ] **Deduplication** (state file, hash set, cursor, or SQLite)
-- [ ] **Atomic state writes** (`.tmp` + `os.replace`)
+- [ ] **Deduplication** (state file, hash set, or cursor)
 - [ ] **Error handling** that does NOT pollute stdout
 - [ ] **Timeouts** on all network connections
 - [ ] **Log rotation** (if using logcollector)
@@ -938,7 +959,6 @@ if __name__ == "__main__":
 | Multi-line JSON | Multiple broken events | `json.dumps(event, separators=(',',':'))` |
 | Errors to stdout | Corrupt events ingested | Log to separate file, or use UNIX socket |
 | No deduplication | Alert flooding | Implement state tracking from day one |
-| Non-atomic state writes | Corruption on crash | `.tmp` + `os.replace()` |
 | No HTTP timeout | Script hangs | `timeout=30` on every call |
 | Events > 65,535 bytes | Silent truncation | Split or reduce payload |
 | stdout for high-volume | Slower, less reliable | UNIX socket for production |
@@ -949,18 +969,11 @@ if __name__ == "__main__":
 /var/ossec/
 ├── wodles/
 │   └── aws/                               # Built-in AWS wodle (reference)
-│       ├── wazuh_integration.py
-│       ├── buckets_s3/
-│       └── ...
 ├── integrations/
 │   ├── virustotal.py                      # Built-in VT (reference)
 │   ├── slack.py                           # Built-in Slack (reference)
 │   ├── custom-myenrichment                # Your integratord scripts
 │   └── custom-db-audit.py                 # Your wodle scripts
-├── var/run/
-│   └── db_audit_state.json                # State files
-├── logs/
-│   └── integrations.log                   # Integratord logs
 └── etc/rules/
     └── custom-db-audit-rules.xml          # Your rules
 ```
@@ -973,8 +986,8 @@ if __name__ == "__main__":
 
 | Resource | URL |
 |---|---|
+| AWS CloudTrail integration | https://documentation.wazuh.com/current/cloud-security/amazon/services/supported-services/cloudtrail.html |
 | `wodle aws-s3` configuration reference | https://documentation.wazuh.com/current/user-manual/reference/ossec-conf/wodle-s3.html |
-| AWS CloudTrail integration guide | https://documentation.wazuh.com/current/cloud-security/amazon/services/supported-services/cloudtrail.html |
 | AWS module considerations | https://documentation.wazuh.com/current/cloud-security/amazon/services/prerequisites/considerations.html |
 
 ### Wodle Command (Case 4)
@@ -1032,13 +1045,11 @@ if __name__ == "__main__":
 
 | Component | URL | What to Learn |
 |---|---|---|
-| **AWS wodle** | https://github.com/wazuh/wazuh/tree/master/wodles/aws | UNIX socket, SQLite dedup, modular architecture |
-| `wazuh_integration.py` | https://github.com/wazuh/wazuh/blob/master/wodles/aws/wazuh_integration.py | `send_msg()`, `WazuhAWSDatabase` |
-| `aws_bucket.py` | https://github.com/wazuh/wazuh/blob/master/wodles/aws/buckets_s3/aws_bucket.py | `already_processed()`, `mark_complete()`, `db_maintenance()` |
-| `utils.py` | https://github.com/wazuh/wazuh/blob/master/wodles/utils.py | `MAX_EVENT_SIZE`, `find_wazuh_path()` |
+| **AWS wodle** | https://github.com/wazuh/wazuh/tree/master/wodles/aws | UNIX socket delivery, state tracking, modular architecture |
 | **Integrations** | https://github.com/wazuh/wazuh/tree/master/integrations | Official integratord scripts |
 | `virustotal.py` | https://github.com/wazuh/wazuh/blob/master/integrations/virustotal.py | Enrich + re-inject via socket |
 | `slack.py` | https://github.com/wazuh/wazuh/blob/master/integrations/slack.py | Notify via HTTP POST |
+| `utils.py` | https://github.com/wazuh/wazuh/blob/master/wodles/utils.py | `MAX_EVENT_SIZE`, `find_wazuh_path()` |
 
 ---
 
