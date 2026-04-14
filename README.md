@@ -274,10 +274,10 @@ result = rule.get_rules(search={"value": "sshd", "negation": False})
 
 | Aspect | Wazuh Framework | Standalone (system Python) |
 |---|---|---|
-| **Access to Wazuh config** | ✅ Direct via internal API | ❌ Must parse XML manually |
-| **Agent information** | ✅ Native SDK | ⚠️ Via REST API |
-| **Portability** | ❌ Manager only | ✅ Any machine |
-| **External dependencies** | ⚠️ Limited | ✅ `pip install` anything |
+| **Access to Wazuh config** |  Direct via internal API |  Must parse XML manually |
+| **Agent information** |  Native SDK |  Via REST API |
+| **Portability** |  Manager only |  Any machine |
+| **External dependencies** |  Limited |  `pip install` anything |
 | **Best for** | Integrations needing Wazuh internals | Polling external APIs |
 
 ---
