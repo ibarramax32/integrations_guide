@@ -7,31 +7,17 @@
 ## Table of Contents
 
 - [1. Data Ingestion Architecture](#1-data-ingestion-architecture)
-  - [How Wazuh Receives Data](#how-does-wazuh-receive-data)
-  - [Ingestion Methods](#ingestion-methods)
 - [2. Data Formatting: How to Present Data to Wazuh](#2-data-formatting-how-to-present-data-to-wazuh)
-  - [Recommended JSON Structure](#recommended-json-structure)
-  - [Critical Formatting Rules](#critical-formatting-rules)
-  - [Writing Output from Your Script](#writing-output-from-your-script)
 - [3. Deduplication: How to Avoid Sending Duplicate Data](#3-deduplication-how-to-avoid-sending-duplicate-data)
-  - [Strategy A: State File with Last Timestamp/ID](#strategy-a-state-file-with-last-timestampid)
-  - [Strategy B: Hash Set for Exact Duplicate Detection](#strategy-b-hash-set-for-exact-duplicate-detection)
-  - [Strategy C: API Cursor with Pagination](#strategy-c-api-cursor-with-pagination)
-  - [Strategy D: SQLite Database (Production-Grade)](#strategy-d-sqlite-database-production-grade)
-  - [Strategy Comparison](#strategy-comparison)
 - [4. Wazuh Python Framework](#4-wazuh-python-framework)
-  - [Location and Usage](#location-and-usage)
-  - [Key Capabilities](#key-capabilities)
-  - [When to Use the Framework vs. Standalone Scripts](#when-to-use-the-framework-vs-standalone-scripts)
 - [5. Practical Use Cases](#5-practical-use-cases)
-  - [Case 1: Wodle Command + UNIX Socket + SQLite (AWS-Style Integration)](#case-1-wodle-command--unix-socket--sqlite-aws-style-integration)
+  - [Case 1: Wodle aws-s3 — AWS CloudTrail (Production Reference)](#case-1-wodle-aws-s3--aws-cloudtrail-production-reference)
   - [Case 2: Log Data Collection via Logcollector](#case-2-log-data-collection-via-logcollector)
-  - [Case 3: Reactive Integration via Integratord (VirusTotal + Slack)](#case-3-reactive-integration-via-integratord-virustotal--slack)
+  - [Case 3: Reactive Integration via Integratord](#case-3-reactive-integration-via-integratord)
+    - [3A: VirusTotal (Enrich + Re-inject via UNIX Socket)](#3a-virustotal-enrich--re-inject-via-unix-socket)
+    - [3B: Slack (Notify Externally via HTTP POST)](#3b-slack-notify-externally-via-http-post)
   - [Case 4: Database Audit Ingestion (PostgreSQL)](#case-4-database-audit-ingestion-postgresql)
 - [6. Common Patterns and Best Practices](#6-common-patterns-and-best-practices)
-  - [Integration Checklist](#integration-checklist)
-  - [Common Mistakes to Avoid](#common-mistakes-to-avoid)
-  - [Recommended Directory Structure](#recommended-directory-structure)
 - [7. Official Wazuh Documentation References](#7-official-wazuh-documentation-references)
 
 ---
@@ -46,7 +32,7 @@ Wazuh processes data through its **analysis engine (analysisd)**. There are seve
 ┌─────────────────┐     ┌──────────────────┐     ┌──────────────────────────┐
 │ External Source  │────▶│  Custom Script    │────▶│  Wazuh Input             │
 │ (API, DB, file)  │     │  (Python/Bash)    │     │                          │
-└─────────────────┘     └──────────────────┘     │  Option A: Wodle Command  │
+└─────────────────┘     └──────────────────┘     │  Option A: Wodle          │
                                                   │  (stdout or UNIX socket)  │
                                                   │                          │
                                                   │  Option B: Logcollector   │
@@ -73,9 +59,9 @@ Wazuh processes data through its **analysis engine (analysisd)**. There are seve
 
 | Method | Mechanism | Best For |
 |---|---|---|
-| **Wodle Command** | `ossec.conf` runs your script on a schedule; output via stdout or UNIX socket | Polling APIs, DB queries, heavy integrations |
-| **Logcollector** | Wazuh reads a log file your script or application writes to | Monitoring application logs, third-party tools output |
-| **Integratord** | Wazuh's native integration framework triggered by alerts | Reactive enrichment (post-alert), notifications |
+| **Wodle Command / aws-s3** | `ossec.conf` runs your script on a schedule; output via stdout or UNIX socket | Polling APIs, cloud services, DB queries |
+| **Logcollector** | Wazuh reads a log file your script or application writes to | Monitoring application logs, third-party tool output |
+| **Integratord** | Wazuh's native integration framework triggered by alerts | Reactive enrichment, notifications |
 | **Syslog Output** | Script sends syslog to the agent/manager | Legacy systems |
 
 ---
@@ -84,7 +70,7 @@ Wazuh processes data through its **analysis engine (analysisd)**. There are seve
 
 ### Core Principle
 
-Wazuh expects **one line of text = one event**. The most effective and recommended format is **single-line JSON**, because:
+Wazuh expects **one line of text = one event**. The most effective format is **single-line JSON**, because:
 
 - Wazuh automatically decodes it with the built-in `json` decoder
 - Fields become available as `data.field_name` in rules
@@ -111,129 +97,98 @@ Wazuh expects **one line of text = one event**. The most effective and recommend
 
 | # | Rule | Why |
 |---|---|---|
-| 1 | **One line per event** — no newlines inside JSON | Wazuh treats each line as a separate event. A multi-line JSON will be parsed as multiple broken events. |
+| 1 | **One line per event** — no newlines inside JSON | Wazuh treats each line as a separate event. Multi-line JSON will be parsed as multiple broken events. |
 | 2 | **Always include `timestamp`** — ISO 8601 format | Ensures accurate event chronology in the indexer. |
 | 3 | **Include a unique identifier field** | Required for effective deduplication (see Section 3). |
 | 4 | **Include an `integration` field** | Allows filtering in rules with `<field name="integration">`. |
 | 5 | **Do not exceed 65,535 bytes per event** | Hard-coded max in `analysisd` ([`MAX_EVENT_SIZE = 65535`](https://github.com/wazuh/wazuh/blob/master/wodles/utils.py#L142)). Events exceeding this are truncated silently. |
 
-### Writing Output from Your Script
-
-There are **two methods** for sending events to Wazuh from a custom script:
+### Writing Output: Two Methods
 
 #### Method 1: stdout (Simple — Wodle captures output)
 
 ```python
-import json
-import sys
+import json, sys
 
 def send_event_stdout(event: dict):
-    """Send an event to stdout — captured by Wazuh wodle command."""
+    """Send event to stdout — captured by wodle command."""
     line = json.dumps(event, separators=(',', ':'))
     print(line)
     sys.stdout.flush()
 ```
 
-#### Method 2: UNIX Socket (Production — Direct to analysisd queue)
+#### Method 2: UNIX Socket (Production — Direct to analysisd)
 
-This is how Wazuh's own AWS integration sends events. It writes directly to the `analysisd` UNIX socket at `/var/ossec/queue/sockets/queue`, bypassing stdout entirely. This is faster, more reliable, and what Wazuh uses in production.
+This is how Wazuh's own AWS integration sends events. It writes directly to the `analysisd` UNIX socket, bypassing stdout. Faster, more reliable.
 
-Extracted from [`wodles/aws/wazuh_integration.py`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/wazuh_integration.py#L293-L324):
+From [`wodles/aws/wazuh_integration.py`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/wazuh_integration.py#L293-L324):
 
 ```python
-import json
-import socket
+import json, socket
 
-WAZUH_PATH = "/var/ossec"
-WAZUH_QUEUE = f"{WAZUH_PATH}/queue/sockets/queue"
+WAZUH_QUEUE = "/var/ossec/queue/sockets/queue"
 MAX_EVENT_SIZE = 65535
 MESSAGE_HEADER = "1:Wazuh-Custom:"  # Format: "1:<location>:"
 
 def send_event_socket(event: dict):
-    """Send an event directly to the analysisd UNIX socket.
-
-    This is the production method used by Wazuh's own integrations
-    (AWS, Azure, Docker, etc.). It bypasses stdout and writes
-    directly to the analysis queue.
-    """
+    """Send event directly to the analysisd UNIX socket."""
     try:
         json_msg = json.dumps(event, default=str)
         s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         s.connect(WAZUH_QUEUE)
         encoded_msg = f"{MESSAGE_HEADER}{json_msg}".encode()
-
         if len(encoded_msg) > MAX_EVENT_SIZE:
-            # Log warning — event will be truncated by analysisd
-            pass  # Handle oversized events (split or reduce payload)
-
+            pass  # Handle oversized events
         s.send(encoded_msg)
         s.close()
     except socket.error as e:
         if e.errno == 111:
             raise ConnectionError("Wazuh must be running.")
         elif e.errno == 90:
-            pass  # Message too long — consider increasing rmem_max
+            pass  # Message too long
         else:
             raise
 ```
 
 > **Message header format:** `"1:<location>:<json_message>"`
-> - The `1` is the event type indicator
-> - `<location>` identifies your integration (e.g., `Wazuh-AWS`, `virustotal`, or your custom name)
-> - This is how `analysisd` knows where the event originated
+> - `1` = event type indicator
+> - `<location>` = identifies your integration (e.g., `Wazuh-AWS`, `virustotal`)
 
 ---
 
 ## 3. Deduplication: How to Avoid Sending Duplicate Data
 
-This is the **most critical** and most frequently misimplemented aspect of custom integrations.
+This is the **most critical** and most frequently misimplemented aspect.
 
 ### Strategy A: State File with Last Timestamp/ID
 
-Persist the last processed timestamp or event ID between runs. On next execution, only query/process events newer than the saved marker.
-
 ```python
-import json
-import os
+import json, os
 
 STATE_FILE = "/var/ossec/var/run/custom_integration_state.json"
 
 def load_state() -> dict:
-    """Load previous execution state."""
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r') as f:
             return json.load(f)
     return {"last_timestamp": None, "last_event_id": None}
 
 def save_state(state: dict):
-    """Persist current state for the next execution."""
     tmp_file = STATE_FILE + ".tmp"
     with open(tmp_file, 'w') as f:
         json.dump(state, f)
     os.replace(tmp_file, STATE_FILE)  # Atomic on POSIX
-
-def get_new_events(all_events: list, state: dict) -> list:
-    """Filter only new events based on saved state."""
-    last_ts = state.get("last_timestamp")
-    if last_ts is None:
-        return all_events
-    return [e for e in all_events if e["timestamp"] > last_ts]
 ```
 
 ### Strategy B: Hash Set for Exact Duplicate Detection
 
-Compute a hash of the identifying fields for each event. Maintain a set of seen hashes and skip any event whose hash already exists.
-
 ```python
-import hashlib
-import json
-import os
+import hashlib, json, os
 
 SEEN_FILE = "/var/ossec/var/run/custom_integration_seen.json"
-MAX_SEEN = 10000  # Limit memory usage
+MAX_SEEN = 10000
 
 def compute_event_hash(event: dict) -> str:
-    """Generate a unique hash based on fields that identify the event."""
     unique_payload = {
         "source": event.get("source"),
         "event_id": event.get("event_id"),
@@ -241,19 +196,6 @@ def compute_event_hash(event: dict) -> str:
     }
     raw = json.dumps(unique_payload, sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
-
-def load_seen_hashes() -> set:
-    if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE, 'r') as f:
-            return set(json.load(f))
-    return set()
-
-def save_seen_hashes(seen: set):
-    seen_list = list(seen)
-    if len(seen_list) > MAX_SEEN:
-        seen_list = seen_list[-MAX_SEEN:]
-    with open(SEEN_FILE, 'w') as f:
-        json.dump(seen_list, f)
 
 def is_duplicate(event: dict, seen: set) -> bool:
     h = compute_event_hash(event)
@@ -265,18 +207,11 @@ def is_duplicate(event: dict, seen: set) -> bool:
 
 ### Strategy C: API Cursor with Pagination
 
-Many modern APIs support cursors or temporal pagination. This is the most reliable method when the source API supports it.
-
 ```python
 import requests
 
 def fetch_with_cursor(api_url: str, headers: dict, state: dict) -> tuple:
-    """
-    Fetch events using API-native cursor pagination.
-    Always prefer this method when the API supports it.
-    """
     params = {"limit": 100, "order": "asc"}
-
     if state.get("next_cursor"):
         params["cursor"] = state["next_cursor"]
     elif state.get("last_timestamp"):
@@ -285,98 +220,61 @@ def fetch_with_cursor(api_url: str, headers: dict, state: dict) -> tuple:
     response = requests.get(api_url, headers=headers, params=params)
     response.raise_for_status()
     data = response.json()
-
-    events = data.get("results", [])
-    new_cursor = data.get("next_cursor")
-
-    return events, new_cursor
+    return data.get("results", []), data.get("next_cursor")
 ```
 
 ### Strategy D: SQLite Database (Production-Grade)
 
-This is **how Wazuh itself solves deduplication** in its AWS integration. Instead of JSON flat files, it uses a SQLite database to track which log files and markers have already been processed. This approach scales to hundreds of thousands of records without memory issues.
-
-Extracted from [`wodles/aws/wazuh_integration.py`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/wazuh_integration.py#L394-L542) — the `WazuhAWSDatabase` class:
+This is **how Wazuh itself solves deduplication**. The `WazuhAWSDatabase` class in [`wodles/aws/wazuh_integration.py`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/wazuh_integration.py#L394-L542) uses SQLite to track processed log files. The `AWSBucket` class in [`wodles/aws/buckets_s3/aws_bucket.py`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/buckets_s3/aws_bucket.py) queries the DB before processing each file:
 
 ```python
-import sqlite3
-import os
+# Simplified from aws_bucket.py — the actual dedup query:
+sql_already_processed = """
+    SELECT count(*) FROM {table_name}
+    WHERE bucket_path=:bucket_path
+      AND aws_account_id=:aws_account_id
+      AND aws_region=:aws_region
+      AND log_key=:log_name;
+"""
+# If count > 0, skip the file. Otherwise, process and INSERT.
+```
 
-WAZUH_WODLE_PATH = "/var/ossec/wodles/my_integration"
+Reusable pattern for your own integrations:
+
+```python
+import sqlite3, os
+from datetime import datetime, timezone, timedelta
 
 class IntegrationDatabase:
-    """
-    SQLite-based deduplication following the same pattern as
-    Wazuh's AWS integration (WazuhAWSDatabase class).
-
-    The DB file lives alongside your wodle, and tracks:
-    - Which items have been processed
-    - A metadata table with the integration version
-    """
-
-    SQL_CREATE_TABLE = """
-        CREATE TABLE IF NOT EXISTS processed_events (
-            event_id TEXT PRIMARY KEY,
-            source TEXT NOT NULL,
-            processed_at TEXT NOT NULL
-        );
-    """
-    SQL_CREATE_METADATA = """
-        CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT NOT NULL,
-            value TEXT NOT NULL,
-            PRIMARY KEY (key, value)
-        );
-    """
-    SQL_CHECK_EVENT = "SELECT 1 FROM processed_events WHERE event_id = :event_id;"
-    SQL_INSERT_EVENT = """
-        INSERT OR IGNORE INTO processed_events (event_id, source, processed_at)
-        VALUES (:event_id, :source, :processed_at);
-    """
-    SQL_CLEANUP_OLD = """
-        DELETE FROM processed_events
-        WHERE processed_at < :cutoff_date;
-    """
-    SQL_OPTIMIZE = "PRAGMA optimize;"
-
-    def __init__(self, db_name: str):
-        self.db_path = os.path.join(WAZUH_WODLE_PATH, f"{db_name}.db")
-        self.conn = sqlite3.connect(self.db_path)
+    def __init__(self, db_path: str):
+        self.conn = sqlite3.connect(db_path)
         self.cursor = self.conn.cursor()
-        self._init_db()
-
-    def _init_db(self):
-        """Create tables if they don't exist."""
-        self.cursor.execute(self.SQL_CREATE_TABLE)
-        self.cursor.execute(self.SQL_CREATE_METADATA)
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS processed_events (
+                event_id TEXT PRIMARY KEY,
+                processed_at TEXT NOT NULL
+            );""")
         self.conn.commit()
 
     def is_duplicate(self, event_id: str) -> bool:
-        """Check if an event has already been processed."""
         result = self.cursor.execute(
-            self.SQL_CHECK_EVENT, {"event_id": event_id}
+            "SELECT 1 FROM processed_events WHERE event_id = ?", (event_id,)
         ).fetchone()
         return result is not None
 
-    def mark_processed(self, event_id: str, source: str):
-        """Mark an event as processed."""
-        from datetime import datetime, timezone
-        self.cursor.execute(self.SQL_INSERT_EVENT, {
-            "event_id": event_id,
-            "source": source,
-            "processed_at": datetime.now(timezone.utc).isoformat()
-        })
+    def mark_processed(self, event_id: str):
+        self.cursor.execute(
+            "INSERT OR IGNORE INTO processed_events (event_id, processed_at) VALUES (?, ?)",
+            (event_id, datetime.now(timezone.utc).isoformat())
+        )
 
-    def cleanup(self, days_to_keep: int = 30):
-        """Remove records older than N days to prevent unbounded growth."""
-        from datetime import datetime, timezone, timedelta
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days_to_keep)).isoformat()
-        self.cursor.execute(self.SQL_CLEANUP_OLD, {"cutoff_date": cutoff})
+    def cleanup(self, days: int = 90):
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        self.cursor.execute("DELETE FROM processed_events WHERE processed_at < ?", (cutoff,))
 
     def close(self):
-        """Commit, optimize, and close — same pattern as WazuhAWSDatabase."""
         self.conn.commit()
-        self.cursor.execute(self.SQL_OPTIMIZE)
+        self.cursor.execute("PRAGMA optimize;")
         self.conn.close()
 ```
 
@@ -384,21 +282,19 @@ class IntegrationDatabase:
 
 | Strategy | Pros | Cons | Use When |
 |---|---|---|---|
-| **State file (timestamp/ID)** | Simple, low disk usage | May miss events arriving out of order | API guarantees chronological order |
-| **Hash set (JSON file)** | Detects exact duplicates regardless of order | Higher memory/disk, doesn't scale past ~50K | Small-scale sources without ordering |
-| **API cursor** | Most reliable, API-native | Depends on API support | Well-designed APIs (most modern ones) |
-| **SQLite database** | Scales to millions of records, ACID guarantees, queryable | Slightly more complex setup | Production integrations (how Wazuh does it) |
+| **State file (timestamp/ID)** | Simple, low disk usage | May miss out-of-order events | API guarantees chronological order |
+| **Hash set (JSON file)** | Detects exact duplicates | Doesn't scale past ~50K | Small-scale sources |
+| **API cursor** | Most reliable, API-native | Depends on API support | Well-designed APIs |
+| **SQLite database** | Scales to millions, ACID, queryable | Slightly more complex | Production integrations (how Wazuh does it) |
 
 ---
 
 ## 4. Wazuh Python Framework
 
-Wazuh ships with its own Python interpreter and SDK located at `/var/ossec/framework/python/`.
-
-### Location and Usage
+Wazuh ships with its own Python interpreter and SDK at `/var/ossec/framework/python/`.
 
 ```bash
-# Wazuh's bundled Python interpreter (includes the SDK)
+# Wazuh's bundled Python interpreter
 /var/ossec/framework/python/bin/python3
 
 # Framework modules
@@ -409,33 +305,24 @@ Wazuh ships with its own Python interpreter and SDK located at `/var/ossec/frame
 
 ```python
 #!/var/ossec/framework/python/bin/python3
-"""
-This script uses Wazuh's Python framework.
-It MUST be executed with Wazuh's bundled interpreter.
-"""
 
-# ── Core: manager information ──
 from wazuh.core.common import WAZUH_PATH       # /var/ossec
-
-# ── Agents ──
 from wazuh import agent
 result = agent.get_agents(q="status=active")
-print(result.affected_items)
 
-# ── Rules ──
 from wazuh import rule
 result = rule.get_rules(search={"value": "sshd", "negation": False})
 ```
 
-### When to Use the Framework vs. Standalone Scripts
+### When to Use Framework vs. Standalone
 
-| Aspect | Wazuh Framework (`/var/ossec/framework/python/`) | Standalone Script (system Python) |
+| Aspect | Wazuh Framework | Standalone (system Python) |
 |---|---|---|
 | **Access to Wazuh config** | ✅ Direct via internal API | ❌ Must parse XML manually |
 | **Agent information** | ✅ Native SDK | ⚠️ Via REST API |
 | **Portability** | ❌ Manager only | ✅ Any machine |
-| **External dependencies** | ⚠️ Limited to Wazuh's environment | ✅ `pip install` anything |
-| **Recommended for** | Integrations that need Wazuh's internal data | Polling external APIs, data transformation |
+| **External dependencies** | ⚠️ Limited | ✅ `pip install` anything |
+| **Best for** | Integrations needing Wazuh internals | Polling external APIs |
 
 ---
 
@@ -443,401 +330,121 @@ result = rule.get_rules(search={"value": "sshd", "negation": False})
 
 ---
 
-### Case 1: Wodle Command + UNIX Socket + SQLite (AWS-Style Integration)
+### Case 1: Wodle aws-s3 — AWS CloudTrail (Production Reference)
 
-**Scenario:** Build a production-grade integration that polls an external API, deduplicates via SQLite, and sends events directly to the analysisd UNIX socket — following the exact same architecture as Wazuh's own `wodles/aws/` integration.
+**Scenario:** Ingest AWS CloudTrail logs from an S3 bucket — the most common cloud integration.
 
-**Method:** Wodle Command
+**Method:** Wazuh's built-in `wodle name="aws-s3"` — a production-grade integration that demonstrates how Wazuh itself solves data ingestion at scale.
 
-**Why this pattern?** This is how Wazuh itself ingests AWS CloudTrail, GuardDuty, VPC Flow Logs, and more. By studying [`wodles/aws/wazuh_integration.py`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/wazuh_integration.py), we can see the three production-grade patterns:
+#### Why Study This Integration
 
-1. **UNIX socket** (`socket.AF_UNIX, socket.SOCK_DGRAM`) instead of stdout — direct write to the analysis queue
-2. **SQLite** for deduplication state — instead of JSON flat files
-3. **Modular architecture** — base class + per-source subclasses
+Before building your own custom integration, it's worth understanding how Wazuh's AWS wodle works. It's the gold standard for how Wazuh ingests external data, and every pattern you need is here:
 
-#### Architecture Overview (from Wazuh's AWS wodle)
+| Pattern | How Wazuh AWS Does It | Source File |
+|---|---|---|
+| **Event delivery** | UNIX socket direct to `analysisd` queue | [`wazuh_integration.py` → `send_msg()`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/wazuh_integration.py#L293-L324) |
+| **Deduplication** | SQLite DB — checks `already_processed()` before ingesting each log file | [`aws_bucket.py` → `already_processed()`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/buckets_s3/aws_bucket.py#L233-L239) |
+| **State persistence** | SQLite `mark_complete()` with `DATETIME('now')` timestamps | [`aws_bucket.py` → `mark_complete()`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/buckets_s3/aws_bucket.py#L244-L254) |
+| **DB maintenance** | Retains only last 500 records per region, deletes older entries | [`aws_bucket.py` → `db_maintenance()`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/buckets_s3/aws_bucket.py#L271-L281) |
+| **Modular architecture** | Base class `WazuhIntegration` → `WazuhAWSDatabase` → per-service subclasses | [`wazuh_integration.py`](https://github.com/wazuh/wazuh/blob/master/wodles/aws/wazuh_integration.py) |
+| **Oversized events** | Logs warning if event exceeds `MAX_EVENT_SIZE` (65,535 bytes) | [`utils.py` line 142](https://github.com/wazuh/wazuh/blob/master/wodles/utils.py#L142) |
+
+#### Architecture
 
 ```
 wodles/aws/
-├── wazuh_integration.py    # Base class: WazuhIntegration (socket + SQLite)
-│   ├── send_msg()          # UNIX socket write to /var/ossec/queue/sockets/queue
-│   ├── WazuhAWSDatabase    # SQLite dedup (inherits WazuhIntegration)
-│   │   ├── init_db()
-│   │   ├── close_db()      # commit + PRAGMA optimize
-│   │   └── check_metadata_version()
+├── wazuh_integration.py      # Base: UNIX socket + SQLite
+│   ├── WazuhIntegration      #   send_msg() → socket AF_UNIX
+│   └── WazuhAWSDatabase      #   SQLite init/close/metadata
 ├── buckets_s3/
-│   ├── aws_bucket.py       # AWSBucket → per-source implementations
-│   ├── cloudtrail.py       # AWSCloudTrailBucket
-│   ├── guardduty.py        # AWSGuardDutyBucket
-│   ├── vpcflow.py          # AWSVPCFlowBucket
+│   ├── aws_bucket.py          # AWSBucket: iter_files → dedup → send
+│   ├── cloudtrail.py          # AWSCloudTrailBucket
+│   ├── guardduty.py           # AWSGuardDutyBucket
+│   ├── vpcflow.py             # AWSVPCFlowBucket
 │   └── ...
 ├── services/
 │   ├── inspector.py
 │   └── cloudwatchlogs.py
-└── aws_s3.py               # Entry point (argument parsing + dispatch)
+└── aws_s3.py                  # Entry point (arg parsing + dispatch)
 ```
 
-#### ossec.conf Configuration
+#### Configuration (ossec.conf)
 
 ```xml
-<wodle name="command">
+<wodle name="aws-s3">
   <disabled>no</disabled>
-  <tag>custom-threat-intel</tag>
-  <command>/var/ossec/framework/python/bin/python3 /var/ossec/wodles/custom-threat-intel/main.py</command>
-  <interval>5m</interval>
-  <ignore_output>yes</ignore_output>  <!-- stdout not needed: we use the socket -->
+  <interval>30m</interval>
   <run_on_start>yes</run_on_start>
-  <timeout>120</timeout>
+  <skip_on_error>no</skip_on_error>
+  <bucket type="cloudtrail">
+    <name>my-cloudtrail-bucket</name>
+    <aws_profile>default</aws_profile>
+    <!-- Optional filters -->
+    <!-- <regions>us-east-1,eu-west-1</regions> -->
+    <!-- <only_logs_after>2026-JAN-01</only_logs_after> -->
+    <!-- <aws_account_id>123456789012</aws_account_id> -->
+  </bucket>
 </wodle>
 ```
 
-> **Key difference from Case 2-4:** `<ignore_output>yes</ignore_output>` — since events go through the UNIX socket, we don't need wodle to capture stdout.
+Other supported bucket types: `guardduty`, `vpcflow`, `config`, `waf`, `alb`, `clb`, `nlb`, `server_access`, `cisco_umbrella`, `custom`.
 
-#### Full Script
+#### Event Flow (What Happens Internally)
 
-```python
-#!/var/ossec/framework/python/bin/python3
-"""
-Custom integration: Threat Intelligence Feed -> Wazuh
-Location: /var/ossec/wodles/custom-threat-intel/main.py
-Method: Wodle Command + UNIX Socket + SQLite
-
-Architecture modeled after Wazuh's own wodles/aws/ integration:
-- UNIX socket for event delivery (not stdout)
-- SQLite for deduplication state (not JSON files)
-- Message header format matching analysisd expectations
-
-Source reference:
-  https://github.com/wazuh/wazuh/tree/master/wodles/aws
-"""
-
-import json
-import os
-import sys
-import socket
-import sqlite3
-from datetime import datetime, timezone
-
-try:
-    import requests
-except ImportError:
-    print("ERROR: requests module is required.")
-    sys.exit(1)
-
-# ── Configuration ──
-API_URL = "https://api.threatfeed.example.com/v1/indicators"
-API_KEY = os.environ.get("THREAT_INTEL_API_KEY", "")
-
-# Paths — following Wazuh conventions
-WAZUH_PATH = "/var/ossec"
-WAZUH_QUEUE = os.path.join(WAZUH_PATH, "queue", "sockets", "queue")
-WODLE_PATH = os.path.join(WAZUH_PATH, "wodles", "custom-threat-intel")
-DB_PATH = os.path.join(WODLE_PATH, "threat_intel.db")
-LOG_FILE = os.path.join(WAZUH_PATH, "logs", "custom-threat-intel.log")
-
-# Message header: "1:<location>:<json>"
-# This matches the protocol analysisd expects on the UNIX socket.
-# See: wazuh_integration.py line 38 → MESSAGE_HEADER = "1:Wazuh-AWS:"
-MESSAGE_HEADER = "1:custom-threat-intel:"
-
-# Max event size: 65535 bytes (from wodles/utils.py line 142)
-MAX_EVENT_SIZE = 65535
-
-INTEGRATION_NAME = "custom-threat-intel"
-
-
-# ══════════════════════════════════════════════════════
-# Logging — never pollute stdout
-# ══════════════════════════════════════════════════════
-def log(level: str, message: str):
-    ts = datetime.now(timezone.utc).isoformat()
-    with open(LOG_FILE, 'a') as f:
-        f.write(f"{ts} [{level.upper()}] {message}\n")
-
-
-# ══════════════════════════════════════════════════════
-# UNIX Socket delivery (from WazuhIntegration.send_msg)
-# ══════════════════════════════════════════════════════
-def send_event(event: dict):
-    """Send event directly to analysisd via UNIX socket.
-
-    This replicates the pattern from wazuh_integration.py send_msg():
-    - AF_UNIX + SOCK_DGRAM
-    - Message format: "1:<location>:<json>"
-    - Error handling for errno 111 (Wazuh not running) and 90 (message too long)
-    """
-    try:
-        json_msg = json.dumps(event, default=str)
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        s.connect(WAZUH_QUEUE)
-        encoded_msg = f"{MESSAGE_HEADER}{json_msg}".encode()
-
-        if len(encoded_msg) > MAX_EVENT_SIZE:
-            log("warn", f"Event size {len(encoded_msg)} exceeds max {MAX_EVENT_SIZE}")
-
-        s.send(encoded_msg)
-        s.close()
-    except socket.error as e:
-        if e.errno == 111:
-            log("error", "Wazuh must be running (errno 111)")
-            sys.exit(11)
-        elif e.errno == 90:
-            log("error", "Message too long for socket buffer. Skipping.")
-        else:
-            log("error", f"Socket error: {e}")
-            sys.exit(13)
-
-
-# ══════════════════════════════════════════════════════
-# SQLite deduplication (from WazuhAWSDatabase pattern)
-# ══════════════════════════════════════════════════════
-class ThreatIntelDB:
-    """SQLite-based state tracking, modeled after WazuhAWSDatabase.
-
-    Key patterns from the source:
-    - metadata table for version tracking
-    - PRAGMA optimize on close
-    - Table existence checks before creation
-    """
-
-    SQL_CREATE_PROCESSED = """
-        CREATE TABLE IF NOT EXISTS processed_indicators (
-            indicator_id TEXT PRIMARY KEY,
-            indicator_value TEXT NOT NULL,
-            processed_at TEXT NOT NULL
-        );
-    """
-    SQL_CREATE_METADATA = """
-        CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT NOT NULL,
-            value TEXT NOT NULL,
-            PRIMARY KEY (key, value)
-        );
-    """
-    SQL_CREATE_CURSOR = """
-        CREATE TABLE IF NOT EXISTS api_cursor (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            last_timestamp TEXT,
-            next_cursor TEXT
-        );
-    """
-
-    def __init__(self):
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        self.conn = sqlite3.connect(DB_PATH)
-        self.cursor = self.conn.cursor()
-        self._init_db()
-
-    def _init_db(self):
-        self.cursor.execute(self.SQL_CREATE_PROCESSED)
-        self.cursor.execute(self.SQL_CREATE_METADATA)
-        self.cursor.execute(self.SQL_CREATE_CURSOR)
-        # Initialize cursor row if not exists
-        self.cursor.execute(
-            "INSERT OR IGNORE INTO api_cursor (id, last_timestamp, next_cursor) VALUES (1, NULL, NULL)"
-        )
-        self.conn.commit()
-
-    def is_duplicate(self, indicator_id: str) -> bool:
-        result = self.cursor.execute(
-            "SELECT 1 FROM processed_indicators WHERE indicator_id = ?",
-            (indicator_id,)
-        ).fetchone()
-        return result is not None
-
-    def mark_processed(self, indicator_id: str, indicator_value: str):
-        self.cursor.execute(
-            "INSERT OR IGNORE INTO processed_indicators (indicator_id, indicator_value, processed_at) "
-            "VALUES (?, ?, ?)",
-            (indicator_id, indicator_value, datetime.now(timezone.utc).isoformat())
-        )
-
-    def get_cursor_state(self) -> dict:
-        row = self.cursor.execute(
-            "SELECT last_timestamp, next_cursor FROM api_cursor WHERE id = 1"
-        ).fetchone()
-        return {"last_timestamp": row[0], "next_cursor": row[1]} if row else {}
-
-    def save_cursor_state(self, last_timestamp: str = None, next_cursor: str = None):
-        self.cursor.execute(
-            "UPDATE api_cursor SET last_timestamp = ?, next_cursor = ? WHERE id = 1",
-            (last_timestamp, next_cursor)
-        )
-
-    def cleanup(self, days: int = 90):
-        """Prevent unbounded DB growth."""
-        from datetime import timedelta
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        self.cursor.execute(
-            "DELETE FROM processed_indicators WHERE processed_at < ?", (cutoff,)
-        )
-
-    def close(self):
-        """Commit, optimize, close — same as WazuhAWSDatabase.close_db()."""
-        self.conn.commit()
-        self.cursor.execute("PRAGMA optimize;")
-        self.conn.close()
-
-
-# ══════════════════════════════════════════════════════
-# API Fetch
-# ══════════════════════════════════════════════════════
-def fetch_indicators(state: dict) -> tuple:
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Accept": "application/json"
-    }
-    params = {"limit": 200, "order": "asc"}
-
-    if state.get("next_cursor"):
-        params["cursor"] = state["next_cursor"]
-    elif state.get("last_timestamp"):
-        params["since"] = state["last_timestamp"]
-
-    try:
-        resp = requests.get(API_URL, headers=headers, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("indicators", []), data.get("next_cursor")
-    except requests.RequestException as e:
-        log("error", f"API request failed: {e}")
-        return [], None
-
-
-# ══════════════════════════════════════════════════════
-# Transformation
-# ══════════════════════════════════════════════════════
-def transform_indicator(indicator: dict) -> dict:
-    severity_map = {"low": 3, "medium": 7, "high": 10, "critical": 13}
-
-    return {
-        "integration": INTEGRATION_NAME,
-        "source": "threat-intel-feed",
-        "event_type": "ioc",
-        "timestamp": indicator.get("created_at",
-                                   datetime.now(timezone.utc).isoformat()),
-        "alert": {
-            "severity": severity_map.get(indicator.get("severity", "low"), 3),
-            "description": (
-                f"Threat indicator: {indicator.get('type', 'unknown')}"
-                f" - {indicator.get('value', 'N/A')}"
-            ),
-        },
-        "data": {
-            "ioc_type": indicator.get("type"),
-            "ioc_value": indicator.get("value"),
-            "threat_type": indicator.get("threat_type"),
-            "confidence": indicator.get("confidence", 0),
-            "source_feed": indicator.get("feed_name"),
-            "tags": indicator.get("tags", []),
-            "first_seen": indicator.get("first_seen"),
-            "last_seen": indicator.get("last_seen"),
-            "reference_url": indicator.get("reference"),
-        }
-    }
-
-
-# ══════════════════════════════════════════════════════
-# Main
-# ══════════════════════════════════════════════════════
-def main():
-    log("info", "Starting threat intel collection")
-
-    db = ThreatIntelDB()
-    state = db.get_cursor_state()
-    total_new = 0
-    total_dup = 0
-
-    try:
-        while True:
-            indicators, next_cursor = fetch_indicators(state)
-
-            if not indicators:
-                break
-
-            for indicator in indicators:
-                ioc_id = str(indicator.get("id", ""))
-                if db.is_duplicate(ioc_id):
-                    total_dup += 1
-                    continue
-
-                event = transform_indicator(indicator)
-                send_event(event)
-                db.mark_processed(ioc_id, indicator.get("value", ""))
-                total_new += 1
-
-            # Update cursor for next page/execution
-            last = indicators[-1]
-            state["last_timestamp"] = last.get("created_at")
-            state["next_cursor"] = next_cursor
-            db.save_cursor_state(state["last_timestamp"], state["next_cursor"])
-
-            if not next_cursor:
-                break
-
-        # Periodic cleanup
-        db.cleanup(days=90)
-
-    finally:
-        db.close()
-
-    log("info", f"Finished: {total_new} new events, {total_dup} duplicates skipped")
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        log("critical", f"Unhandled exception: {e}")
-        sys.exit(1)
+```
+1. aws_s3.py parses args, selects AWSCloudTrailBucket class
+2. iter_bucket() → init_db() creates SQLite table if not exists
+3. iter_files_in_bucket() → list_objects_v2() on S3
+4. For each log file:
+   a. already_processed()? → SELECT count(*) FROM table WHERE log_key=:name
+      - If yes → skip
+   b. get_log_file() → download + decompress (gzip/zip)
+   c. iter_events() → for each JSON event in "Records":
+      - event_should_be_skipped()? → apply discard_regex
+      - get_alert_msg() → wrap in {"integration":"aws", "aws":{...}}
+      - send_msg() → UNIX socket to /var/ossec/queue/sockets/queue
+   d. mark_complete() → INSERT INTO table (log_key, processed_date, ...)
+5. db_maintenance() → DELETE old records beyond retention limit (500)
+6. close_db() → COMMIT + PRAGMA optimize
 ```
 
-#### Custom Rules
+#### What a CloudTrail Event Looks Like in Wazuh
 
-```xml
-<!-- /var/ossec/etc/rules/custom-threat-intel-rules.xml -->
-<group name="custom,threat-intel,">
-
-  <!-- Base rule: any event from this integration -->
-  <rule id="100100" level="0">
-    <decoded_as>json</decoded_as>
-    <field name="integration">custom-threat-intel</field>
-    <description>Threat intelligence integration event.</description>
-  </rule>
-
-  <!-- Low confidence IOC -->
-  <rule id="100101" level="3">
-    <if_sid>100100</if_sid>
-    <field name="data.confidence">^[0-4]\d$|^[0-9]$</field>
-    <description>Low confidence threat indicator: $(data.ioc_type) - $(data.ioc_value)</description>
-    <group>threat_intel,ioc,low,</group>
-  </rule>
-
-  <!-- High confidence IOC -->
-  <rule id="100102" level="10">
-    <if_sid>100100</if_sid>
-    <field name="data.confidence">^(8\d|9\d|100)$</field>
-    <description>High confidence threat indicator: $(data.ioc_type) - $(data.ioc_value)</description>
-    <group>threat_intel,ioc,high,</group>
-  </rule>
-
-  <!-- Critical IOC -->
-  <rule id="100103" level="13">
-    <if_sid>100100</if_sid>
-    <field name="alert.severity">13</field>
-    <description>CRITICAL threat indicator: $(data.ioc_type) - $(data.ioc_value)</description>
-    <group>threat_intel,ioc,critical,</group>
-    <options>alert_by_email</options>
-  </rule>
-
-</group>
+```json
+{
+  "integration": "aws",
+  "aws": {
+    "log_info": {
+      "aws_account_alias": "",
+      "log_file": "AWSLogs/123456789012/CloudTrail/us-east-1/2026/04/14/..._CloudTrail_us-east-1_20260414T0000Z_abc.json.gz",
+      "s3bucket": "my-cloudtrail-bucket"
+    },
+    "eventVersion": "1.08",
+    "eventSource": "iam.amazonaws.com",
+    "eventName": "CreateUser",
+    "awsRegion": "us-east-1",
+    "sourceIPAddress": "203.0.113.50",
+    "userAgent": "console.amazonaws.com",
+    "source": "cloudtrail",
+    "aws_account_id": "123456789012"
+  }
+}
 ```
+
+#### Applying This to Your Own Custom Integrations
+
+If you're building a custom wodle that polls an external API, follow the same architecture:
+
+1. **Use UNIX socket** instead of stdout (set `<ignore_output>yes</ignore_output>` in your wodle config)
+2. **Use SQLite** for dedup state instead of JSON flat files (see Strategy D in Section 3)
+3. **Build a message header** matching the protocol: `"1:My-Integration:<json>"`
+4. **Implement DB maintenance** — don't let the state DB grow forever
 
 > **📖 Official Docs & Source Code:**
-> - [Wodle Command configuration reference](https://documentation.wazuh.com/current/user-manual/reference/ossec-conf/wodle-command.html)
-> - [Custom rules](https://documentation.wazuh.com/current/user-manual/ruleset/rules/custom.html)
-> - [Custom decoders](https://documentation.wazuh.com/current/user-manual/ruleset/decoders/custom.html)
-> - **Wazuh AWS wodle source code:** [github.com/wazuh/wazuh/tree/master/wodles/aws](https://github.com/wazuh/wazuh/tree/master/wodles/aws)
+> - [wodle `aws-s3` configuration reference](https://documentation.wazuh.com/current/user-manual/reference/ossec-conf/wodle-s3.html)
+> - [AWS CloudTrail integration guide](https://documentation.wazuh.com/current/cloud-security/amazon/services/supported-services/cloudtrail.html)
+> - [AWS module considerations](https://documentation.wazuh.com/current/cloud-security/amazon/services/prerequisites/considerations.html)
+> - **Source code:** [github.com/wazuh/wazuh/tree/master/wodles/aws](https://github.com/wazuh/wazuh/tree/master/wodles/aws)
 
 ---
 
@@ -868,7 +475,6 @@ if __name__ == "__main__":
 The only thing required is a `<localfile>` block in `ossec.conf` on the agent (or server):
 
 ```xml
-<!-- Monitor a JSON log file -->
 <localfile>
   <location>/var/log/myapp/events.log</location>
   <log_format>json</log_format>
@@ -896,16 +502,14 @@ That's it. When `<log_format>` is set to `json`, Wazuh automatically:
 
 **Monitor with wildcards:**
 ```xml
-<!-- Monitor all .log files in a directory -->
 <localfile>
   <location>/var/log/myapp/*.log</location>
   <log_format>json</log_format>
 </localfile>
 ```
 
-**Monitor with date-based file names:**
+**Date-based file names:**
 ```xml
-<!-- File name changes daily -->
 <localfile>
   <location>/var/log/myapp/events-%Y-%m-%d.log</location>
   <log_format>json</log_format>
@@ -922,32 +526,15 @@ That's it. When `<log_format>` is set to `json`, Wazuh automatically:
 </localfile>
 ```
 
-**Monitor a non-JSON log with syslog format:**
-```xml
-<localfile>
-  <location>/var/log/legacy-app/output.log</location>
-  <log_format>syslog</log_format>
-</localfile>
-```
-
 #### If Your Script Writes the Log File
 
-When your custom script generates the log data, follow these rules:
-
 ```python
-import json
-import fcntl
+import json, fcntl
 
 OUTPUT_FILE = "/var/log/myapp/events.log"
 
 def write_event(event: dict):
-    """Write a single event to the log file.
-
-    Rules:
-    - One JSON object per line (no newlines inside JSON)
-    - Use file locking to prevent partial writes
-    - Wazuh's logcollector handles reading — you just write
-    """
+    """Write a single event to the log file with file locking."""
     line = json.dumps(event, separators=(',', ':'))
     with open(OUTPUT_FILE, 'a') as f:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
@@ -959,8 +546,6 @@ def write_event(event: dict):
 
 #### Log Rotation
 
-Since the file grows continuously, configure log rotation:
-
 ```
 # /etc/logrotate.d/myapp
 /var/log/myapp/events.log {
@@ -969,11 +554,9 @@ Since the file grows continuously, configure log rotation:
     compress
     missingok
     notifempty
-    copytruncate   # Required: don't move the file, truncate in place
+    copytruncate   # Required: truncate in place so logcollector keeps tracking
 }
 ```
-
-> **Important:** Use `copytruncate` instead of the default rotate behavior. This ensures Wazuh's logcollector doesn't lose track of the file descriptor.
 
 > **📖 Official Docs:**
 > - [Log data collection overview](https://documentation.wazuh.com/current/user-manual/capabilities/log-data-collection/index.html)
@@ -982,51 +565,39 @@ Since the file grows continuously, configure log rotation:
 
 ---
 
-### Case 3: Reactive Integration via Integratord (VirusTotal + Slack)
+### Case 3: Reactive Integration via Integratord
 
-**Scenario:** When Wazuh generates an alert, automatically react — enrich it with VirusTotal data, or send a notification to Slack.
+**Scenario:** When Wazuh generates an alert, automatically react — enrich it, or send a notification.
 
-**Method:** Integratord (Wazuh's built-in integration daemon)
+**Method:** Integratord (`wazuh-integratord`) — a daemon that watches for alerts and executes your script.
 
 #### How Integratord Works
 
-Integratord is a daemon (`wazuh-integratord`) that watches for alerts matching your criteria and executes your integration script. The contract is:
-
 ```
-┌─────────────┐     ┌──────────────────┐     ┌────────────────────────┐
-│  Alert       │────▶│  wazuh-integratord│────▶│  Your script           │
-│  matches     │     │  writes alert to  │     │                        │
-│  criteria    │     │  temp JSON file   │     │  argv[1] = alert file  │
-│              │     │                   │     │  argv[2] = api_key     │
-│              │     │                   │     │  argv[3] = hook_url    │
-│              │     │                   │     │  argv[4] = alert_format│
-└─────────────┘     └──────────────────┘     └───────────┬────────────┘
-                                                          │
-                                              ┌───────────▼────────────┐
-                                              │  Script response:      │
-                                              │                        │
-                                              │  Option A: Send to     │
-                                              │  UNIX socket (VT-style)│
-                                              │                        │
-                                              │  Option B: POST to     │
-                                              │  webhook (Slack-style) │
-                                              └────────────────────────┘
+┌─────────────┐     ┌──────────────────┐     ┌──────────────────────────┐
+│  Alert       │────▶│  wazuh-integratord│────▶│  Your script             │
+│  matches     │     │  writes alert to  │     │                          │
+│  criteria    │     │  temp JSON file   │     │  argv[1] = alert file    │
+│              │     │                   │     │  argv[2] = api_key       │
+└─────────────┘     └──────────────────┘     │  argv[3] = hook_url      │
+                                              └──────────────────────────┘
 ```
 
-#### The Two Patterns in Wazuh's Official Integrations
+Wazuh ships with **two official integration scripts** that demonstrate two fundamentally different patterns. Both live in [`integrations/`](https://github.com/wazuh/wazuh/tree/master/integrations):
 
-Wazuh ships with two integration scripts that demonstrate two fundamentally different response patterns. Both live in [`integrations/`](https://github.com/wazuh/wazuh/tree/master/integrations):
+| Script | Pattern | Response Method |
+|---|---|---|
+| [`virustotal.py`](https://github.com/wazuh/wazuh/blob/master/integrations/virustotal.py) | **Enrich + re-inject** | UNIX socket back to `analysisd` |
+| [`slack.py`](https://github.com/wazuh/wazuh/blob/master/integrations/slack.py) | **Notify externally** | HTTP POST to webhook |
 
-| Script | Pattern | What It Does | Response Method |
-|---|---|---|---|
-| [`virustotal.py`](https://github.com/wazuh/wazuh/blob/master/integrations/virustotal.py) | **Enrich + re-inject** | Queries VT API, builds enriched alert, sends back to Wazuh | **UNIX socket** to analysisd |
-| [`slack.py`](https://github.com/wazuh/wazuh/blob/master/integrations/slack.py) | **Notify externally** | Formats alert as Slack attachment, POSTs to webhook | **HTTP POST** to Slack API |
+---
 
-#### Pattern A: Enrich + Re-inject (VirusTotal Style)
+#### 3A: VirusTotal (Enrich + Re-inject via UNIX Socket)
 
-From [`integrations/virustotal.py`](https://github.com/wazuh/wazuh/blob/master/integrations/virustotal.py):
+When Wazuh detects a file integrity change, query VirusTotal to check if the file is malicious, then **send the enriched alert back into Wazuh** for further rule processing.
 
 **ossec.conf:**
+
 ```xml
 <integration>
   <name>virustotal</name>
@@ -1036,20 +607,50 @@ From [`integrations/virustotal.py`](https://github.com/wazuh/wazuh/blob/master/i
 </integration>
 ```
 
-**Key code — how `virustotal.py` sends enriched data back via UNIX socket:**
+**How it works** (from the [actual source code](https://github.com/wazuh/wazuh/blob/master/integrations/virustotal.py)):
+
+1. `wazuh-integratord` detects an alert matching the `syscheck` group
+2. Writes the alert JSON to a temp file
+3. Calls: `virustotal.py <alert_file> <api_key> <hook_url> ...`
+4. The script reads the alert, extracts the `md5_after` hash
+5. Queries the VirusTotal API (`/vtapi/v2/file/report`)
+6. Builds an enriched message:
 
 ```python
-# From integrations/virustotal.py lines 317-333
-# This is the actual Wazuh production code:
+# From virustotal.py — the enriched output structure:
+alert_output = {
+    'integration': 'virustotal',
+    'virustotal': {
+        'found': 1,              # Was the hash in VT's database?
+        'malicious': 1,          # Was it flagged as malicious?
+        'positives': 15,         # How many engines detected it
+        'total': 70,             # Total engines
+        'sha1': '...',
+        'permalink': 'https://www.virustotal.com/...',
+        'source': {
+            'alert_id': '...',
+            'file': '/path/to/suspicious/file',
+            'md5': '...',
+            'sha1': '...',
+        }
+    }
+}
+```
+
+7. **Sends it back to Wazuh via UNIX socket** (the key pattern):
+
+```python
+# From virustotal.py lines 317-333 — actual Wazuh code:
 
 SOCKET_ADDR = f'{pwd}/queue/sockets/queue'
 
 def send_msg(msg, agent=None):
-    # Build the message with location routing
+    # Build message with agent routing
     if not agent or agent['id'] == '000':
         string = '1:virustotal:{0}'.format(json.dumps(msg))
     else:
-        # Include agent info for proper alert routing
+        # Include agent info so the enriched alert is associated
+        # with the original agent
         location = '[{0}] ({1}) {2}'.format(
             agent['id'], agent['name'],
             agent['ip'] if 'ip' in agent else 'any'
@@ -1057,20 +658,26 @@ def send_msg(msg, agent=None):
         location = location.replace('|', '||').replace(':', '|:')
         string = '1:{0}->virustotal:{1}'.format(location, json.dumps(msg))
 
-    # Send via UNIX socket
     sock = socket(AF_UNIX, SOCK_DGRAM)
     sock.connect(SOCKET_ADDR)
     sock.send(string.encode())
     sock.close()
 ```
 
-> **Important detail:** Notice the message header includes agent routing information (`[agent_id] (agent_name) agent_ip->virustotal`). This ensures the enriched alert is correctly associated with the original agent.
+> **Key takeaway:** The enriched data goes back INTO Wazuh's analysis pipeline. You can then write rules that match on `virustotal.malicious`, `virustotal.positives`, etc.
 
-#### Pattern B: External Notification (Slack Style)
+> **📖 Official Docs & Source:**
+> - [VirusTotal integration PoC](https://documentation.wazuh.com/current/proof-of-concept-guide/detect-remove-malware-virustotal.html)
+> - [Source: `integrations/virustotal.py`](https://github.com/wazuh/wazuh/blob/master/integrations/virustotal.py)
 
-From [`integrations/slack.py`](https://github.com/wazuh/wazuh/blob/master/integrations/slack.py):
+---
+
+#### 3B: Slack (Notify Externally via HTTP POST)
+
+When Wazuh generates a high-severity alert, send a formatted notification to a Slack channel. Data goes **out** of Wazuh — nothing comes back in.
 
 **ossec.conf:**
+
 ```xml
 <integration>
   <name>slack</name>
@@ -1080,11 +687,42 @@ From [`integrations/slack.py`](https://github.com/wazuh/wazuh/blob/master/integr
 </integration>
 ```
 
-**Key code — how `slack.py` sends notifications via HTTP:**
+**How it works** (from the [actual source code](https://github.com/wazuh/wazuh/blob/master/integrations/slack.py)):
+
+1. `wazuh-integratord` detects an alert with level ≥ 7
+2. Calls: `slack.py <alert_file> <api_key> <hook_url> ...`
+3. The script reads the alert and formats a Slack attachment:
 
 ```python
-# From integrations/slack.py lines 195-207
-# Slack doesn't send data back to Wazuh — it sends OUT to Slack
+# From slack.py — message construction:
+level = alert['rule']['level']
+
+if level <= 4:
+    color = 'good'       # green
+elif level <= 7:
+    color = 'warning'    # yellow
+else:
+    color = 'danger'     # red
+
+msg = {
+    'color': color,
+    'pretext': 'WAZUH Alert',
+    'title': alert['rule']['description'],
+    'text': alert.get('full_log'),
+    'fields': [
+        {'title': 'Agent',    'value': f"({agent['id']}) - {agent['name']}"},
+        {'title': 'Location', 'value': alert['location']},
+        {'title': 'Rule ID',  'value': f"{alert['rule']['id']} _(Level {level})_"},
+    ]
+}
+
+payload = {'attachments': [msg]}
+```
+
+4. **Sends it to Slack via HTTP POST** (simple and direct):
+
+```python
+# From slack.py lines 195-207 — actual Wazuh code:
 
 def send_msg(msg, url):
     headers = {
@@ -1094,216 +732,36 @@ def send_msg(msg, url):
     res = requests.post(url, data=msg, headers=headers, timeout=10)
 ```
 
-#### Custom Integration Example (Combining Both Patterns)
+> **Key takeaway:** Unlike VirusTotal, Slack is a one-way notification — no UNIX socket, no data re-injection. The script just POSTs and exits. Use this pattern for any outbound notification (PagerDuty, Teams, email APIs, ticketing systems, etc.).
 
-Here's a custom integration that enriches with VirusTotal AND notifies Slack:
-
-**ossec.conf:**
-```xml
-<integration>
-  <name>custom-vt-slack</name>
-  <hook_url>https://hooks.slack.com/services/YOUR/WEBHOOK/URL</hook_url>
-  <api_key>YOUR_VT_API_KEY</api_key>
-  <level>7</level>
-  <rule_id>550,554</rule_id>
-  <alert_format>json</alert_format>
-</integration>
-```
-
-**Script:**
-
-```python
-#!/var/ossec/framework/python/bin/python3
-"""
-Custom integration: VirusTotal enrichment + Slack notification
-Location: /var/ossec/integrations/custom-vt-slack
-(no .py extension, must be executable)
-
-Combines both official integration patterns:
-- virustotal.py: query API + send enriched data back via UNIX socket
-- slack.py: format alert + POST to webhook
-
-Source references:
-  https://github.com/wazuh/wazuh/blob/master/integrations/virustotal.py
-  https://github.com/wazuh/wazuh/blob/master/integrations/slack.py
-"""
-
-import json
-import os
-import sys
-from socket import AF_UNIX, SOCK_DGRAM, socket
-
-try:
-    import requests
-except ImportError:
-    print("No module 'requests' found. Install: pip install requests")
-    sys.exit(1)
-
-# Paths
-pwd = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-LOG_FILE = f'{pwd}/logs/integrations.log'
-SOCKET_ADDR = f'{pwd}/queue/sockets/queue'
-
-debug_enabled = False
-
-
-def debug(msg: str):
-    if debug_enabled:
-        print(msg)
-        with open(LOG_FILE, 'a') as f:
-            f.write(msg + '\n')
-
-
-def read_alert(alert_file: str) -> dict:
-    with open(alert_file, 'r') as f:
-        return json.load(f)
-
-
-def extract_hash(alert: dict) -> str:
-    syscheck = alert.get("syscheck", {})
-    for field in ["sha256_after", "sha1_after", "md5_after"]:
-        h = syscheck.get(field)
-        if h:
-            return h
-    return None
-
-
-def query_virustotal(file_hash: str, api_key: str) -> dict:
-    params = {'apikey': api_key, 'resource': file_hash}
-    headers = {'Accept-Encoding': 'gzip, deflate'}
-    try:
-        resp = requests.get(
-            'https://www.virustotal.com/vtapi/v2/file/report',
-            params=params, headers=headers, timeout=10
-        )
-        if resp.status_code == 200:
-            return resp.json()
-        return {"response_code": -1, "error": f"HTTP {resp.status_code}"}
-    except requests.RequestException as e:
-        return {"response_code": -1, "error": str(e)}
-
-
-def send_to_wazuh(msg: dict, agent: dict = None):
-    """Send enriched alert back to Wazuh via UNIX socket.
-    Follows the same pattern as integrations/virustotal.py send_msg().
-    """
-    if not agent or agent.get('id') == '000':
-        string = '1:custom-vt-slack:{0}'.format(json.dumps(msg))
-    else:
-        location = '[{0}] ({1}) {2}'.format(
-            agent['id'], agent['name'],
-            agent.get('ip', 'any')
-        )
-        location = location.replace('|', '||').replace(':', '|:')
-        string = '1:{0}->custom-vt-slack:{1}'.format(location, json.dumps(msg))
-
-    try:
-        sock = socket(AF_UNIX, SOCK_DGRAM)
-        sock.connect(SOCKET_ADDR)
-        sock.send(string.encode())
-        sock.close()
-    except Exception as e:
-        debug(f'# Error sending to socket: {e}')
-
-
-def send_to_slack(alert: dict, vt_data: dict, webhook_url: str):
-    """Send notification to Slack.
-    Follows the same pattern as integrations/slack.py send_msg().
-    """
-    positives = vt_data.get('positives', 0)
-    total = vt_data.get('total', 0)
-    file_path = alert.get('syscheck', {}).get('path', 'N/A')
-
-    color = 'danger' if positives > 5 else ('warning' if positives > 0 else 'good')
-
-    payload = {
-        "attachments": [{
-            "color": color,
-            "pretext": "WAZUH - VirusTotal File Analysis",
-            "title": f"File: {file_path}",
-            "text": f"VirusTotal: {positives}/{total} engines detected this file",
-            "fields": [
-                {"title": "Agent", "value": alert.get('agent', {}).get('name', 'N/A'), "short": True},
-                {"title": "Rule", "value": alert.get('rule', {}).get('description', 'N/A'), "short": True},
-                {"title": "VT Link", "value": vt_data.get('permalink', 'N/A')},
-            ]
-        }]
-    }
-
-    headers = {'content-type': 'application/json', 'Accept-Charset': 'UTF-8'}
-    try:
-        requests.post(webhook_url, data=json.dumps(payload), headers=headers, timeout=10)
-    except requests.RequestException as e:
-        debug(f'# Error sending to Slack: {e}')
-
-
-def main():
-    global debug_enabled
-
-    if len(sys.argv) < 4:
-        debug('# Error: bad arguments')
-        sys.exit(2)
-
-    alert_file = sys.argv[1]
-    api_key = sys.argv[2]
-    webhook_url = sys.argv[3]
-    debug_enabled = len(sys.argv) > 4 and sys.argv[4] == 'debug'
-
-    alert = read_alert(alert_file)
-    file_hash = extract_hash(alert)
-
-    if not file_hash:
-        debug('# No hash found in alert')
-        return
-
-    # 1. Query VirusTotal
-    vt_data = query_virustotal(file_hash, api_key)
-
-    # 2. Build enriched alert and send back to Wazuh (Pattern A)
-    enriched = {
-        'integration': 'custom-vt-slack',
-        'virustotal': {
-            'found': 1 if vt_data.get('response_code', 0) == 1 else 0,
-            'positives': vt_data.get('positives', 0),
-            'total': vt_data.get('total', 0),
-            'permalink': vt_data.get('permalink', ''),
-            'source': {
-                'file': alert.get('syscheck', {}).get('path'),
-                'md5': alert.get('syscheck', {}).get('md5_after'),
-                'alert_id': alert.get('id'),
-            }
-        }
-    }
-    send_to_wazuh(enriched, alert.get('agent'))
-
-    # 3. Notify Slack (Pattern B)
-    if vt_data.get('positives', 0) > 0:
-        send_to_slack(alert, vt_data, webhook_url)
-
-
-if __name__ == '__main__':
-    try:
-        main()
-    except Exception as e:
-        debug(str(e))
-        raise
-```
-
-#### Required Permissions
-
-```bash
-chmod 750 /var/ossec/integrations/custom-vt-slack
-chown root:wazuh /var/ossec/integrations/custom-vt-slack
-```
-
-> **📖 Official Docs & Source Code:**
-> - [Integration configuration reference (ossec.conf)](https://documentation.wazuh.com/current/user-manual/reference/ossec-conf/integration.html)
+> **📖 Official Docs & Source:**
+> - [Integration configuration reference](https://documentation.wazuh.com/current/user-manual/reference/ossec-conf/integration.html)
 > - [wazuh-integratord daemon](https://documentation.wazuh.com/current/user-manual/reference/daemons/wazuh-integratord.html)
 > - [External API integration](https://documentation.wazuh.com/current/user-manual/manager/integration-with-external-apis.html)
-> - [VirusTotal integration PoC](https://documentation.wazuh.com/current/proof-of-concept-guide/detect-remove-malware-virustotal.html)
-> - **Wazuh integrations source code:** [github.com/wazuh/wazuh/tree/master/integrations](https://github.com/wazuh/wazuh/tree/master/integrations)
->   - [`virustotal.py`](https://github.com/wazuh/wazuh/blob/master/integrations/virustotal.py) — Enrich + UNIX socket pattern
->   - [`slack.py`](https://github.com/wazuh/wazuh/blob/master/integrations/slack.py) — Notify + HTTP POST pattern
+> - [Source: `integrations/slack.py`](https://github.com/wazuh/wazuh/blob/master/integrations/slack.py)
+
+---
+
+#### Building Your Own Custom Integration
+
+Custom integratord scripts must:
+
+1. **Be named with the `custom-` prefix** (e.g., `custom-myintegration`)
+2. **Have no `.py` extension** and be **executable** (`chmod 750`)
+3. **Be placed in** `/var/ossec/integrations/`
+4. **Accept the standard argv contract:** `argv[1]=alert_file`, `argv[2]=api_key`, `argv[3]=hook_url`
+5. Choose a response pattern:
+   - **Enrich + re-inject** → send to UNIX socket (VirusTotal pattern)
+   - **Notify externally** → HTTP POST (Slack pattern)
+   - **Both** → combine both patterns in your script
+
+```bash
+chmod 750 /var/ossec/integrations/custom-myintegration
+chown root:wazuh /var/ossec/integrations/custom-myintegration
+```
+
+> **📖 Source Code Reference:**
+> - **Wazuh integrations directory:** [github.com/wazuh/wazuh/tree/master/integrations](https://github.com/wazuh/wazuh/tree/master/integrations)
 
 ---
 
@@ -1312,8 +770,6 @@ chown root:wazuh /var/ossec/integrations/custom-vt-slack
 **Scenario:** Query a PostgreSQL audit table every 10 minutes and inject change events.
 
 **Method:** Wodle Command
-
-#### Full Script
 
 ```python
 #!/usr/bin/env python3
@@ -1328,9 +784,7 @@ Expected audit table:
             executed_at TIMESTAMP WITH TIME ZONE)
 """
 
-import json
-import sys
-import os
+import json, sys, os
 from datetime import datetime, timezone
 
 try:
@@ -1345,7 +799,6 @@ except ImportError:
     }))
     sys.exit(1)
 
-# ── Config ──
 DB_CONFIG = {
     "host": os.environ.get("DB_HOST", "localhost"),
     "port": int(os.environ.get("DB_PORT", "5432")),
@@ -1373,11 +826,8 @@ def save_state(state: dict):
 
 
 def fetch_audit_records(last_id: int) -> list:
-    """
-    Deduplication by auto-increment ID:
-    Only queries records with ID greater than the last processed one.
-    This is the most efficient pattern for tables with sequential PKs.
-    """
+    """Deduplication by auto-increment ID:
+    Only queries records with ID > last processed."""
     conn = psycopg2.connect(**DB_CONFIG)
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -1385,9 +835,7 @@ def fetch_audit_records(last_id: int) -> list:
                 SELECT id, action, table_name, user_name,
                        old_data, new_data, executed_at
                 FROM audit_log
-                WHERE id > %s
-                ORDER BY id ASC
-                LIMIT %s
+                WHERE id > %s ORDER BY id ASC LIMIT %s
             """, (last_id, BATCH_SIZE))
             return cur.fetchall()
     finally:
@@ -1396,14 +844,9 @@ def fetch_audit_records(last_id: int) -> list:
 
 def transform_record(record: dict) -> dict:
     severity_map = {
-        "INSERT": 3,
-        "UPDATE": 5,
-        "DELETE": 8,
-        "TRUNCATE": 13,
-        "ALTER": 13,
-        "DROP": 15,
+        "INSERT": 3, "UPDATE": 5, "DELETE": 8,
+        "TRUNCATE": 13, "ALTER": 13, "DROP": 15,
     }
-
     action = record.get("action", "UNKNOWN").upper()
 
     changed_fields = []
@@ -1421,10 +864,7 @@ def transform_record(record: dict) -> dict:
                       else str(record.get("executed_at"))),
         "alert": {
             "severity": severity_map.get(action, 5),
-            "description": (
-                f"Database {action} on {record.get('table_name')} "
-                f"by {record.get('user_name')}"
-            ),
+            "description": f"Database {action} on {record.get('table_name')} by {record.get('user_name')}",
         },
         "data": {
             "record_id": record.get("id"),
@@ -1432,10 +872,8 @@ def transform_record(record: dict) -> dict:
             "table_name": record.get("table_name"),
             "db_user": record.get("user_name"),
             "changed_fields": changed_fields,
-            "old_data": (json.dumps(record["old_data"])
-                         if record.get("old_data") else None),
-            "new_data": (json.dumps(record["new_data"])
-                         if record.get("new_data") else None),
+            "old_data": json.dumps(record["old_data"]) if record.get("old_data") else None,
+            "new_data": json.dumps(record["new_data"]) if record.get("new_data") else None,
         }
     }
 
@@ -1448,7 +886,6 @@ def send_event(event: dict):
 def main():
     state = load_state()
     last_id = state.get("last_id", 0)
-
     records = fetch_audit_records(last_id)
 
     for record in records:
@@ -1464,13 +901,12 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        err = {
+        print(json.dumps({
             "integration": INTEGRATION_NAME,
             "event_type": "integration_error",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "data": {"error": str(e)}
-        }
-        print(json.dumps(err, separators=(',', ':')))
+        }, separators=(',', ':')))
         sys.exit(1)
 ```
 
@@ -1484,50 +920,64 @@ if __name__ == "__main__":
 ### Integration Checklist
 
 - [ ] **Format:** Single-line JSON per event
-- [ ] **`data.integration` field** included for rule filtering
+- [ ] **`integration` field** for rule filtering
 - [ ] **ISO 8601 timestamp** in every event
-- [ ] **Deduplication mechanism** (state file, hash set, cursor, or SQLite)
-- [ ] **Error handling** that does NOT pollute stdout (or use UNIX socket)
+- [ ] **Deduplication** (state file, hash set, cursor, or SQLite)
+- [ ] **Atomic state writes** (`.tmp` + `os.replace`)
+- [ ] **Error handling** that does NOT pollute stdout
 - [ ] **Timeouts** on all network connections
-- [ ] **Log rotation** on the output file (if using logcollector)
-- [ ] **Permissions:** `750` for scripts, owner `root:wazuh`
-- [ ] **Sensitive variables** in env vars, NEVER hardcoded
+- [ ] **Log rotation** (if using logcollector)
+- [ ] **Permissions:** `750`, owner `root:wazuh`
+- [ ] **Secrets** in env vars, NEVER hardcoded
 - [ ] **Matching rules XML** in `/var/ossec/etc/rules/`
 
 ### Common Mistakes to Avoid
 
 | Mistake | Consequence | Solution |
 |---|---|---|
-| Multi-line JSON | Wazuh interprets it as multiple broken events | `json.dumps(event, separators=(',',':'))` |
-| Printing errors to stdout | Error messages are ingested as corrupt events | Log errors to a separate file, or use UNIX socket delivery |
-| No deduplication | Alert flooding, disk fills up | Implement state tracking from day one |
-| No timeout on HTTP requests | Script hangs, wodle kills it via global timeout | `timeout=30` on every HTTP call |
-| Events > 65,535 bytes | Silently truncated by `analysisd` | Split large events or reduce payload |
-| Using stdout when socket is better | Slower, depends on wodle capturing output | Use UNIX socket for high-volume integrations |
+| Multi-line JSON | Multiple broken events | `json.dumps(event, separators=(',',':'))` |
+| Errors to stdout | Corrupt events ingested | Log to separate file, or use UNIX socket |
+| No deduplication | Alert flooding | Implement state tracking from day one |
+| Non-atomic state writes | Corruption on crash | `.tmp` + `os.replace()` |
+| No HTTP timeout | Script hangs | `timeout=30` on every call |
+| Events > 65,535 bytes | Silent truncation | Split or reduce payload |
+| stdout for high-volume | Slower, less reliable | UNIX socket for production |
 
 ### Recommended Directory Structure
 
 ```
 /var/ossec/
 ├── wodles/
-│   └── custom-threat-intel/            # Wodle-based integrations
-│       ├── main.py                     #   (like wodles/aws/)
-│       └── threat_intel.db             #   SQLite state
+│   └── aws/                               # Built-in AWS wodle (reference)
+│       ├── wazuh_integration.py
+│       ├── buckets_s3/
+│       └── ...
 ├── integrations/
-│   ├── custom-vt-slack                 # Integratord scripts (no extension)
-│   └── custom-db-audit.py
+│   ├── virustotal.py                      # Built-in VT (reference)
+│   ├── slack.py                           # Built-in Slack (reference)
+│   ├── custom-myenrichment                # Your integratord scripts
+│   └── custom-db-audit.py                 # Your wodle scripts
+├── var/run/
+│   └── db_audit_state.json                # State files
+├── logs/
+│   └── integrations.log                   # Integratord logs
 └── etc/rules/
-    ├── custom-threat-intel-rules.xml   # Rules per integration
-    └── custom-db-audit-rules.xml
+    └── custom-db-audit-rules.xml          # Your rules
 ```
 
 ---
 
 ## 7. Official Wazuh Documentation References
 
-All technical claims in this guide have been verified against official Wazuh documentation and source code.
+### Wodle aws-s3 (Case 1)
 
-### Wodle Command (Cases 1 & 4)
+| Resource | URL |
+|---|---|
+| `wodle aws-s3` configuration reference | https://documentation.wazuh.com/current/user-manual/reference/ossec-conf/wodle-s3.html |
+| AWS CloudTrail integration guide | https://documentation.wazuh.com/current/cloud-security/amazon/services/supported-services/cloudtrail.html |
+| AWS module considerations | https://documentation.wazuh.com/current/cloud-security/amazon/services/prerequisites/considerations.html |
+
+### Wodle Command (Case 4)
 
 | Resource | URL |
 |---|---|
@@ -1570,7 +1020,7 @@ All technical claims in this guide have been verified against official Wazuh doc
 |---|---|
 | `wazuh-analysisd` daemon reference | https://documentation.wazuh.com/current/user-manual/reference/daemons/wazuh-analysisd.html |
 | Event size limit (65,535 bytes) | https://github.com/wazuh/wazuh/issues/17689 |
-| `MAX_EVENT_SIZE` constant in source | https://github.com/wazuh/wazuh/blob/master/wodles/utils.py#L142 |
+| `MAX_EVENT_SIZE` in source | https://github.com/wazuh/wazuh/blob/master/wodles/utils.py#L142 |
 
 ### General
 
@@ -1582,12 +1032,13 @@ All technical claims in this guide have been verified against official Wazuh doc
 
 | Component | URL | What to Learn |
 |---|---|---|
-| **AWS wodle** | https://github.com/wazuh/wazuh/tree/master/wodles/aws | UNIX socket delivery, SQLite dedup, modular architecture |
-| `wazuh_integration.py` | https://github.com/wazuh/wazuh/blob/master/wodles/aws/wazuh_integration.py | `send_msg()` socket pattern, `WazuhAWSDatabase` class |
+| **AWS wodle** | https://github.com/wazuh/wazuh/tree/master/wodles/aws | UNIX socket, SQLite dedup, modular architecture |
+| `wazuh_integration.py` | https://github.com/wazuh/wazuh/blob/master/wodles/aws/wazuh_integration.py | `send_msg()`, `WazuhAWSDatabase` |
+| `aws_bucket.py` | https://github.com/wazuh/wazuh/blob/master/wodles/aws/buckets_s3/aws_bucket.py | `already_processed()`, `mark_complete()`, `db_maintenance()` |
 | `utils.py` | https://github.com/wazuh/wazuh/blob/master/wodles/utils.py | `MAX_EVENT_SIZE`, `find_wazuh_path()` |
 | **Integrations** | https://github.com/wazuh/wazuh/tree/master/integrations | Official integratord scripts |
-| `virustotal.py` | https://github.com/wazuh/wazuh/blob/master/integrations/virustotal.py | Enrich + re-inject via socket pattern |
-| `slack.py` | https://github.com/wazuh/wazuh/blob/master/integrations/slack.py | Notify via HTTP POST pattern |
+| `virustotal.py` | https://github.com/wazuh/wazuh/blob/master/integrations/virustotal.py | Enrich + re-inject via socket |
+| `slack.py` | https://github.com/wazuh/wazuh/blob/master/integrations/slack.py | Notify via HTTP POST |
 
 ---
 
